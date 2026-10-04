@@ -1,0 +1,12 @@
+__pycache__
+Notes
+Results
+debian_build/*.buildinfo
+debian_build/*.changes
+
+.*~
+*~
+*.bak
+*.new
+*.old
+*.orig

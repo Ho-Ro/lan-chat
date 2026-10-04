@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=LAN Chat
+Name[de]=LAN Chat
+GenericName=LAN Messenger
+GenericName[de]=LAN Nachrichtendienst
+Comment=Simple LAN chat for Linux
+Comment[de]=Einfacher LAN-Chat für Linux
+Icon=lan-chat
+Exec=/usr/bin/lan-chat
+Terminal=false
+Categories=Network;Chat;
+StartupNotify=true
+StartupWMClass=LAN Chat
+Keywords=chat;lan;network;message;messenger;
+

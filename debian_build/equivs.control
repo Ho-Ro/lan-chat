@@ -1,0 +1,39 @@
+### control file for lan-chat
+### this defines the debian build
+
+Package: lan-chat
+Version: 0.1~devel
+Homepage: https://github.com/Ho-Ro/lan-chat
+Maintainer: Martin Homuth-Rosemann <Ho-Ro@github.com>
+Section: comm
+Priority: extra
+Standards-Version: 3.9.2
+Architecture: all
+Depends: ${misc:Depends}, python3-pyqt6
+Changelog: changelog
+Copyright: copyright
+Readme: README.md
+Files: ../lan-chat /usr/bin/
+ ../lan-chat.png /usr/share/pixmaps/
+ ../lan-chat.desktop /usr/share/applications/
+Description: Peer-to-peer (P2P) chat program for a trusted LAN
+
+
+### Commented entries have reasonable defaults.
+### Uncomment to edit them.
+
+# Source: <source package name; defaults to package name>
+# Pre-Depends: <comma-separated list of packages>
+# Depends: <comma-separated list of packages>
+# Recommends: <comma-separated list of packages>
+# Suggests: <comma-separated list of packages>
+# Provides: <comma-separated list of packages>
+# Replaces: <comma-separated list of packages>
+# Multi-Arch: <one of: foreign|same|allowed>
+# Extra-Files: <comma-separated list of additional files for the doc directory>
+# Files: <pair of space-separated paths; First is file to install, second is destination directory>
+#  <more pairs, if there's more than one file to install. Notice the starting space>
+# Links: <pair of space-separated paths; First is path symlink points at, second is filename of link>
+#  <more pairs, if there's more than one file to include. Notice the starting space>
+
+

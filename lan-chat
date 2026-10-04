@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+lan-chat - quick text exchange for a small local network.
+
+Design goals:
+* Connectionless: UDP broadcast only, one datagram = one message.
+  No connections, handshakes or message framing to break; peers
+  appear and disappear freely and are pruned by heartbeat timeout.
+* Copy and paste first:
+  - click any message to copy its text (without timestamp and
+    sender) to the clipboard
+  - drag to select char by char, double-click a word,
+    triple-click the whole received message
+  - drag text or a small text file from any application onto the
+    window to compose a message
+  - drag a user from the user list onto the input to switch to a
+    private note; double-click a user does the same
+  - middle-click paste (X11 primary selection) works as usual
+* Single file, one deliberate dependency: PyQt6, because the
+  standard library cannot do OS-level drag and drop.
+* Plaintext, no authentication - only for trusted networks.
+
+Usage:
+  lan-chat                  start with your system username
+  lan-chat --name "Ada"   start with a custom name
+"""
+
+import argparse
+import getpass
+import hashlib
+import html
+import json
+import random
+import socket
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime
+
+from PyQt6.QtCore import pyqtSignal, QObject, QMimeData, Qt, QTimer
+from PyQt6.QtGui import (QBrush, QColor, QDrag, QTextCursor,
+                             QTextBlockUserData)
+from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel,
+                             QListWidget, QListWidgetItem, QMainWindow,
+                             QMenu, QMessageBox, QPlainTextEdit,
+                             QPushButton, QSplitter, QTextEdit,
+                             QVBoxLayout, QWidget)
+
+PROTOCOL_KEY = "lan-chat"
+PROTOCOL_VERSION = 1
+BROADCAST_PORT = 5055
+BROADCAST_ADDR = "255.255.255.255"
+MAX_DATAGRAM = 8192
+MAX_TEXT = 4000
+MAX_DROP_FILE = 65536
+HEARTBEAT_INTERVAL = 2.0
+PEER_TIMEOUT = 8.0
+OWN_COLOR = "#1a7f37"
+MIME_PEER = "application/x-lan-chat-peer"
+
+
+class Signals(QObject):
+    message = pyqtSignal(str, str, bool)
+    peer_joined = pyqtSignal(str)
+    peer_left = pyqtSignal(str)
+    peer_changed = pyqtSignal(str)
+    system = pyqtSignal(str)
+    raise_window = pyqtSignal()
+
+
+class MessageBlockData(QTextBlockUserData):
+    """Attachment for message paragraphs: where the pure message
+    text starts inside the block and the original text (without
+    timestamp and sender)."""
+
+    def __init__(self, offset: int, text: str) -> None:
+        super().__init__()
+        self.offset = offset
+        self.text = text
+
+
+class HistoryView(QTextEdit):
+    text_dropped = pyqtSignal(str)
+    files_dropped = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFontFamily("Monospace")
+        self._press_pos = None
+        self._click_count = 0
+        self._last_press_time = 0.0
+        self._last_press_pos = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            now = time.monotonic() * 1000.0
+            interval = (QApplication.styleHints()
+                        .mouseDoubleClickInterval())
+            if (self._last_press_pos is not None
+                    and now - self._last_press_time <= interval
+                    and (pos - self._last_press_pos).manhattanLength() <= 4):
+                self._click_count += 1
+            else:
+                self._click_count = 1
+            self._last_press_time = now
+            self._last_press_pos = pos
+            self._press_pos = pos
+            if self._click_count >= 3:
+                self._click_count = 0
+                self._select_message_at(pos)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._press_pos is not None
+                and (event.position().toPoint()
+                     - self._press_pos).manhattanLength() <= 4
+                and self._click_count == 1):
+            self._copy_message_at(event.position().toPoint())
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
+
+    def _message_data_at(self, pos):
+        block = self.cursorForPosition(pos).block()
+        data = block.userData()
+        if isinstance(data, MessageBlockData):
+            return block, data
+        return None, None
+
+    def _copy_message_at(self, pos):
+        block, data = self._message_data_at(pos)
+        if block is None:
+            return
+        QApplication.clipboard().setText(data.text)
+        self._select_message(block, data)
+        self._flash_block(block)
+
+    def _select_message_at(self, pos):
+        block, data = self._message_data_at(pos)
+        if block is None:
+            return
+        self._select_message(block, data)
+        self._flash_block(block)
+
+    def _select_message(self, block, data):
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(block.position() + data.offset)
+        cursor.setPosition(block.position() + len(block.text()),
+                         QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+
+    def _flash_block(self, block):
+        selection = QTextEdit.ExtraSelection()
+        selection.format.setBackground(QBrush(QColor("#fff3a0")))
+        selection.cursor = QTextCursor(block)
+        self.setExtraSelections([selection])
+        QTimer.singleShot(400, lambda: self.setExtraSelections([]))
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasText() or mime.hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasUrls():
+            self.files_dropped.emit([url.toLocalFile() for url in mime.urls()])
+        elif mime.hasText():
+            self.text_dropped.emit(mime.text())
+        event.acceptProposedAction()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        copy_all_action = menu.addAction("Copy all")
+        select_all_action = menu.addAction("Select all")
+        action = menu.exec(event.globalPosition().toPoint())
+        if action == copy_action:
+            self.copy()
+        elif action == copy_all_action:
+            QApplication.clipboard().setText(self.toPlainText())
+        elif action == select_all_action:
+            self.selectAll()
+
+
+class InputView(QPlainTextEdit):
+    send_requested = pyqtSignal()
+    text_dropped = pyqtSignal(str)
+    files_dropped = pyqtSignal(list)
+    peer_dropped = pyqtSignal(bytes)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaximumHeight(120)
+
+    def keyPressEvent(self, event):
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            self.send_requested.emit()
+        else:
+            super().keyPressEvent(event)
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasText() or mime.hasUrls() or mime.hasFormat(MIME_PEER):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(MIME_PEER):
+            self.peer_dropped.emit(bytes(mime.data(MIME_PEER)))
+        elif mime.hasUrls():
+            self.files_dropped.emit([url.toLocalFile() for url in mime.urls()])
+        elif mime.hasText():
+            self.text_dropped.emit(mime.text())
+        event.acceptProposedAction()
+
+
+class UserList(QListWidget):
+    peer_dragged = pyqtSignal(bytes)
+    private_requested = pyqtSignal(bytes)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_pos = None
+
+    def mousePressEvent(self, event):
+        self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and self._press_pos is not None
+                and (event.position().toPoint() - self._press_pos).manhattanLength()
+                >= QApplication.startDragDistance()):
+            item = self.itemAt(event.position().toPoint())
+            if item is not None:
+                drag = QDrag(self)
+                mime = QMimeData()
+                mime.setText(item.text())
+                mime.setData(MIME_PEER, item.data(Qt.ItemDataRole.UserRole))
+                drag.setMimeData(mime)
+                drag.exec(Qt.DropAction.CopyAction)
+        super().mouseMoveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        if item is not None:
+            self.private_requested.emit(item.data(Qt.ItemDataRole.UserRole))
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        if item is None:
+            return
+        menu = QMenu(self)
+        private_action = menu.addAction("Send private note")
+        copy_action = menu.addAction("Copy name")
+        action = menu.exec(event.globalPosition().toPoint())
+        if action == private_action:
+            self.private_requested.emit(item.data(Qt.ItemDataRole.UserRole))
+        elif action == copy_action:
+            QApplication.clipboard().setText(item.text())
+
+
+class FlashDrop(QMainWindow):
+    def __init__(self, username: str) -> None:
+        super().__init__()
+        self.username = username
+        self.instance_id = uuid.uuid4().hex
+        self.peers = {}
+        self.pm_target_id = None
+        self.last_received = ""
+        self.running = False
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            self.sock.bind(("", BROADCAST_PORT))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot bind UDP port {BROADCAST_PORT}: {exc}\n"
+                "Is another lan-chat instance already running?")
+        self.sock.settimeout(1.0)
+
+        self.signals = Signals()
+        self.signals.message.connect(self._on_message)
+        self.signals.peer_joined.connect(self._on_peer_joined)
+        self.signals.peer_left.connect(self._on_peer_left)
+        self.signals.peer_changed.connect(lambda _pid: self._refresh_users())
+        self.signals.system.connect(self._system_message)
+        self.signals.raise_window.connect(self._raise_window)
+
+        self._init_ui()
+
+        self.running = True
+        threading.Thread(target=self._receiver_loop, daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        self.prune_timer = QTimer(self)
+        self.prune_timer.timeout.connect(self._prune_peers)
+        self.prune_timer.start(2000)
+
+    def _init_ui(self) -> None:
+        self.setWindowTitle(f"lan-chat - {self.username}")
+        self.resize(820, 560)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
+
+        chat_widget = QWidget()
+        chat_layout = QVBoxLayout(chat_widget)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.history = HistoryView()
+        chat_layout.addWidget(self.history)
+
+        input_layout = QHBoxLayout()
+        self.input = InputView()
+        self.input.setPlaceholderText(
+            "Type your message ... (Enter sends, Shift+Enter for a new line)")
+        self.input.send_requested.connect(self.send)
+        self.input.text_dropped.connect(self._on_text_drop)
+        self.input.files_dropped.connect(self._on_files_drop)
+        self.input.peer_dropped.connect(self._on_private_requested)
+        self.history.text_dropped.connect(self._on_text_drop)
+        self.history.files_dropped.connect(self._on_files_drop)
+        input_layout.addWidget(self.input)
+
+        self.send_btn = QPushButton("Send")
+        self.send_btn.clicked.connect(self.send)
+        input_layout.addWidget(self.send_btn)
+        chat_layout.addLayout(input_layout)
+        splitter.addWidget(chat_widget)
+
+        side_widget = QWidget()
+        side_layout = QVBoxLayout(side_widget)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+
+        side_layout.addWidget(QLabel("Users on the network"))
+        self.user_list = UserList()
+        self.user_list.peer_dragged.connect(self._on_private_requested)
+        self.user_list.private_requested.connect(self._on_private_requested)
+        side_layout.addWidget(self.user_list)
+
+        self.recipient_label = QLabel("to: everyone")
+        side_layout.addWidget(self.recipient_label)
+        self.peer_count_label = QLabel("0 peers")
+        side_layout.addWidget(self.peer_count_label)
+
+        copy_all_btn = QPushButton("Copy whole chat")
+        copy_all_btn.clicked.connect(self.copy_all)
+        side_layout.addWidget(copy_all_btn)
+
+        copy_last_btn = QPushButton("Copy last received")
+        copy_last_btn.clicked.connect(self._copy_last_received)
+        side_layout.addWidget(copy_last_btn)
+
+        side_layout.addStretch(1)
+        splitter.addWidget(side_widget)
+        splitter.setSizes([560, 260])
+
+        self._system_message(f"You are lan-chat as {self.username}. "
+                             "Other lan-chat users appear automatically.")
+        self._system_message("Drag text or a small text file into the input, "
+                             "click any message to copy it, "
+                             "drag a user onto the input for a private note.")
+
+    def _color_for(self, key: str) -> str:
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+        hue = int(digest[:8], 16) % 360
+        return QColor.fromHsl(hue, 190, 110).name()
+
+    def _append_message(self, name: str, text: str, *, own: bool = False,
+                        private: bool = False, peer_id: str = None) -> None:
+        color = OWN_COLOR if own else self._color_for(peer_id or name)
+        time_str = datetime.now().strftime("%H:%M:%S")
+        prefix = "[PM] " if private else ""
+        safe_name = html.escape(name)
+        safe_text = html.escape(text).replace("\n", "<br/>")
+        lead = f"[{time_str}] {prefix}{name}: "
+        doc = (f'<p style="margin:2px 0;">'
+               f'<span style="color:{color};font-weight:bold;">'
+               f'{html.escape(lead)}</span> {safe_text}</p>')
+        self.history.append(doc)
+        block = self.history.textCursor().block()
+        block_text = block.text()
+        offset = len(lead)
+        if not block_text.startswith(lead):
+            marker = block_text.find(": ", block_text.find("]"))
+            offset = marker + 2 if marker >= 0 else 0
+        block.setUserData(MessageBlockData(offset, text))
+
+    def _system_message(self, message: str) -> None:
+        time_str = datetime.now().strftime("%H:%M:%S")
+        doc = (f'<p style="margin:2px 0;">'
+               f'<span style="color:#777777;font-style:italic;">'
+               f'[{time_str}] -- {html.escape(message)}</span></p>')
+        self.history.append(doc)
+
+    def _on_message(self, peer_id: str, text: str, private: bool) -> None:
+        peer = self.peers.get(peer_id)
+        name = peer["name"] if peer else "?"
+        self.last_received = text
+        self._append_message(name, text, private=private, peer_id=peer_id)
+
+    def _on_peer_joined(self, peer_id: str) -> None:
+        self._refresh_users()
+        peer = self.peers.get(peer_id)
+        if peer:
+            self._system_message(f"{peer['name']} appeared")
+
+    def _on_peer_left(self, peer_id: str) -> None:
+        peer = self.peers.pop(peer_id, None)
+        if self.pm_target_id == peer_id:
+            self.set_pm_target(None)
+            self._system_message("Private note partner went away")
+        self._refresh_users()
+        if peer:
+            self._system_message(f"{peer['name']} went away")
+
+    def _base_name(self, peer_id: str) -> str:
+        info = self.peers.get(peer_id)
+        if info is None:
+            return ""
+        same_name = [pid for pid, other in self.peers.items()
+                     if other["name"] == info["name"]]
+        if len(same_name) > 1:
+            return f'{info["name"]} @{info["ip"]}'
+        return info["name"]
+
+    def _refresh_users(self) -> None:
+        self.user_list.clear()
+        base = {peer_id: self._base_name(peer_id)
+                for peer_id in self.peers}
+        counts = {}
+        for label in base.values():
+            counts[label] = counts.get(label, 0) + 1
+        rows = []
+        for peer_id, label in base.items():
+            if counts[label] > 1:
+                label = f"{label} #{peer_id[:6]}"
+            rows.append((label.lower(), label, peer_id))
+        for _key, label, peer_id in sorted(rows):
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, peer_id.encode("utf-8"))
+            self.user_list.addItem(item)
+        self.peer_count_label.setText(
+            f"{len(self.peers)} peer{'s' if len(self.peers) != 1 else ''}")
+
+    def _raise_window(self) -> None:
+        self._raise_now()
+        QTimer.singleShot(100, self._raise_now)
+
+    def _raise_now(self) -> None:
+        self.show()
+        self.setWindowState(
+            self.windowState() & ~Qt.WindowState.WindowMinimized
+            | Qt.WindowState.WindowActive)
+        self.raise_()
+        self.activateWindow()
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.requestActivate()
+            try:
+                handle.alert(1000)
+            except Exception:
+                pass
+
+    def _send(self, payload: dict) -> None:
+        payload = dict(payload)
+        payload.setdefault("k", PROTOCOL_KEY)
+        payload.setdefault("v", PROTOCOL_VERSION)
+        try:
+            self.sock.sendto(json.dumps(payload).encode("utf-8"),
+                             (BROADCAST_ADDR, BROADCAST_PORT))
+        except OSError:
+            pass
+
+    def _receiver_loop(self) -> None:
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(MAX_DATAGRAM)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self._handle_datagram(data, addr)
+
+    def _handle_datagram(self, data: bytes, addr) -> None:
+        try:
+            msg = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if msg.get("k") != PROTOCOL_KEY or msg.get("v") != PROTOCOL_VERSION:
+            return
+        peer_id = msg.get("id")
+        if not peer_id or peer_id == self.instance_id:
+            return
+        mtype = msg.get("t")
+        if mtype == "hello":
+            name = str(msg.get("name") or "anon")[:64]
+            known = peer_id in self.peers
+            old_name = self.peers[peer_id]["name"] if known else None
+            self.peers[peer_id] = {"name": name, "ip": addr[0],
+                                   "last_seen": time.time()}
+            if not known:
+                self.signals.peer_joined.emit(peer_id)
+            elif old_name != name:
+                self.signals.peer_changed.emit(peer_id)
+        elif mtype == "bye":
+            self.signals.peer_left.emit(peer_id)
+        elif mtype == "msg":
+            text = str(msg.get("text") or "")[:MAX_TEXT]
+            if text:
+                self.signals.message.emit(peer_id, text, False)
+        elif mtype == "pm":
+            if msg.get("to") != self.instance_id:
+                return
+            text = str(msg.get("text") or "")[:MAX_TEXT]
+            if text:
+                self.signals.message.emit(peer_id, text, True)
+                self.signals.raise_window.emit()
+
+    def _heartbeat_loop(self) -> None:
+        while self.running:
+            self._send({"t": "hello", "id": self.instance_id,
+                        "name": self.username})
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def _prune_peers(self) -> None:
+        now = time.time()
+        stale = [peer_id for peer_id, info in self.peers.items()
+                 if now - info["last_seen"] > PEER_TIMEOUT]
+        for peer_id in stale:
+            self._on_peer_left(peer_id)
+
+    def send(self) -> None:
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        if len(text) > MAX_TEXT:
+            text = text[:MAX_TEXT]
+            self._system_message(f"Message was cut to {MAX_TEXT} characters")
+        if self.pm_target_id:
+            target = self.peers.get(self.pm_target_id)
+            if target is None:
+                self._system_message("Private target is gone - "
+                                     "message not sent")
+                self.set_pm_target(None)
+                return
+            self._send({"t": "pm", "id": self.instance_id,
+                        "name": self.username,
+                        "to": self.pm_target_id, "text": text})
+            self._append_message(f"You -> {target['name']}", text,
+                                 own=True, private=True)
+        else:
+            self._send({"t": "msg", "id": self.instance_id,
+                        "name": self.username, "text": text})
+            self._append_message("You", text, own=True)
+        self.input.clear()
+        self.input.setFocus()
+
+    def set_pm_target(self, peer_id) -> None:
+        self.pm_target_id = peer_id
+        if peer_id and peer_id in self.peers:
+            name = self.peers[peer_id]["name"]
+            self.recipient_label.setText(f"to: {name} (private)")
+            self.input.setPlaceholderText(
+                f"Private note to {name} ... (Esc cancels)")
+        else:
+            self.pm_target_id = None
+            self.recipient_label.setText("to: everyone")
+            self.input.setPlaceholderText(
+                "Type your message ... (Enter sends, Shift+Enter for "
+                "a new line)")
+
+    def _on_private_requested(self, peer_id_bytes: bytes) -> None:
+        peer_id = peer_id_bytes.decode("utf-8")
+        if peer_id in self.peers:
+            self.set_pm_target(peer_id)
+            self.input.setFocus()
+
+    def _on_text_drop(self, text: str) -> None:
+        self.input.insertPlainText(text)
+        self.input.setFocus()
+
+    def _on_files_drop(self, paths) -> None:
+        for path in paths:
+            if not path:
+                continue
+            try:
+                with open(path, "rb") as handle:
+                    raw = handle.read(MAX_DROP_FILE + 1)
+            except OSError:
+                self._system_message(f"Cannot read {path}")
+                continue
+            if len(raw) > MAX_DROP_FILE:
+                self.input.insertPlainText(f"[file too big to send: {path}]")
+                continue
+            try:
+                self.input.insertPlainText(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self.input.insertPlainText(f"[not a text file: {path}]")
+        self.input.setFocus()
+
+    def copy_all(self) -> None:
+        QApplication.clipboard().setText(self.history.toPlainText())
+
+    def _copy_last_received(self) -> None:
+        if self.last_received:
+            QApplication.clipboard().setText(self.last_received)
+            self._system_message("Last received text copied")
+        else:
+            self._system_message("Nothing received yet")
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.pm_target_id:
+            self.set_pm_target(None)
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self.running = False
+        if self.prune_timer:
+            self.prune_timer.stop()
+        self._send({"t": "bye", "id": self.instance_id,
+                    "name": self.username})
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        event.accept()
+
+
+def _default_username() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:
+        return f"user-{random.randint(1000, 9999)}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="lan-chat - quick text exchange for a small "
+                    "local network")
+    parser.add_argument("--name", help="display name (default: "
+                                       "system username)")
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv)
+    try:
+        window = FlashDrop(args.name or _default_username())
+    except RuntimeError as exc:
+        QMessageBox.critical(None, "lan-chat", str(exc))
+        return 1
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
