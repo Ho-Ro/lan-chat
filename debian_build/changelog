@@ -1,6 +1,21 @@
-lan-chat (0.1~devel) unstable; urgency=medium
+lan-chat (0.1) unstable; urgency=medium
 
-  * 1st test version
+  * Connectionless UDP design: one JSON datagram per event on
+    port 5055, no server, no handshakes, no message framing
+  * Survives lossy WiFi: heartbeats and messages are sent as
+    subnet-directed broadcast plus unicast to every known peer,
+    and sequence numbers make the duplicates invisible, so
+    neither peers nor messages get lost
+  * Presence lifecycle: peers are dimmed after 8 s without a
+    heartbeat and removed after 60 s, so vanished peers
+    disappear cleanly
+  * Several instances coexist: random instance ids, the same
+    user on multiple PCs shows up as name@machine, and private
+    notes still reach the right instance
+  * Copy and paste first: click a message to copy its bare text
+    (no timestamp, no sender), triple-click selects the whole
+    received message, drag text or a small text file onto the
+    window to compose, drag a user to send a private note
   * debian packaging with the help of equivs
 
- -- Martin Homuth-Rosemann <Ho-Ro@github.com>  Sun, 04 Oct 2026 21:00:00 +0200
+ -- Martin Homuth-Rosemann <Ho-Ro@github.com>  Mon, 05 Oct 2026 19:18:15 +0200

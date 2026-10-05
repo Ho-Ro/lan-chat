@@ -6,12 +6,14 @@ Peer-to-peer: every instance is identical, there is no server.
 ## Usage
 
 ```
-lan-chat                  start with your system username
+lan-chat                start with your system username
 lan-chat --name "Ada"   start with a custom name
 ```
 
-Only one instance per machine: a second instance cannot bind
-the UDP port and exits with an error.
+Every instance has a random id, so several instances can
+coexist: multiple instances per machine work, and two PCs
+where you are logged in as the same user show up as
+"name@machine" (private notes still reach the right one).
 
 ### Mouse and keyboard
 
@@ -34,12 +36,21 @@ Buttons: Send, Copy whole chat, Copy last received.
 
 Connectionless UDP broadcast on port 5055:
 
-- every 2 seconds each instance broadcasts a `hello` datagram
-  with its random instance id and display name
-- a chat message is one broadcast datagram (`msg`); a private
-  note is a `pm` datagram addressed to one instance id
-- peers are pruned after 8 seconds without a heartbeat; a
-  `bye` datagram is sent on exit
+- every 2 seconds each instance broadcasts a `hello`
+  datagram with its random instance id, display name
+  and machine name - once as subnet-directed
+  broadcast on every network interface, plus a
+  unicast copy to every known peer (WiFi
+  retransmits unicast, so presence survives lost
+  broadcasts)
+- a chat message (`msg`) or private note (`pm`, addressed
+  to one instance id) is sent as subnet-directed
+  broadcast plus unicast to every known peer; each
+  carries a sequence number and duplicates are
+  ignored, so WiFi broadcast loss cannot drop it
+- a peer is dimmed after 8 seconds without a heartbeat
+  and removed after 60 seconds; a `bye` datagram is
+  sent on exit
 - one datagram = one message, max 4000 characters
 
 No TCP, no connections, no handshakes: peers appear and

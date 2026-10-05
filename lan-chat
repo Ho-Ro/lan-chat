@@ -4,9 +4,17 @@
 lan-chat - quick text exchange for a small local network.
 
 Design goals:
-* Connectionless: UDP broadcast only, one datagram = one message.
-  No connections, handshakes or message framing to break; peers
-  appear and disappear freely and are pruned by heartbeat timeout.
+* Connectionless: UDP only, one datagram = one message.
+  No connections, handshakes or message framing to break.
+  Every datagram is sent once as subnet-directed
+  broadcast on each network interface (global
+  broadcast only as fallback), plus unicast to
+  known peers (WiFi retransmits unicast); each
+  message carries a sequence number and duplicates
+  are ignored, so a message is delivered exactly
+  once even when both paths arrive; peers are
+  dimmed after 8 s without a heartbeat and
+  removed after 60 s.
 * Copy and paste first:
   - click any message to copy its text (without timestamp and
     sender) to the clipboard
@@ -22,7 +30,7 @@ Design goals:
 * Plaintext, no authentication - only for trusted networks.
 
 Usage:
-  lan-chat                  start with your system username
+  lan-chat                start with your system username
   lan-chat --name "Ada"   start with a custom name
 """
 
@@ -33,6 +41,7 @@ import html
 import json
 import random
 import socket
+import struct
 import sys
 import threading
 import time
@@ -57,6 +66,8 @@ MAX_TEXT = 4000
 MAX_DROP_FILE = 65536
 HEARTBEAT_INTERVAL = 2.0
 PEER_TIMEOUT = 8.0
+HARD_TIMEOUT = 60.0
+SEEN_TIMEOUT = 300.0
 OWN_COLOR = "#1a7f37"
 MIME_PEER = "application/x-lan-chat-peer"
 
@@ -281,6 +292,8 @@ class FlashDrop(QMainWindow):
         self.peers = {}
         self.pm_target_id = None
         self.last_received = ""
+        self._seen = {}
+        self._seq = 0
         self.running = False
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -291,7 +304,7 @@ class FlashDrop(QMainWindow):
         except OSError as exc:
             raise RuntimeError(
                 f"Cannot bind UDP port {BROADCAST_PORT}: {exc}\n"
-                "Is another lan-chat instance already running?")
+                "Is another application already using it?")
         self.sock.settimeout(1.0)
 
         self.signals = Signals()
@@ -413,25 +426,25 @@ class FlashDrop(QMainWindow):
         self.history.append(doc)
 
     def _on_message(self, peer_id: str, text: str, private: bool) -> None:
-        peer = self.peers.get(peer_id)
-        name = peer["name"] if peer else "?"
+        name = self._base_name(peer_id) or "?"
         self.last_received = text
         self._append_message(name, text, private=private, peer_id=peer_id)
 
     def _on_peer_joined(self, peer_id: str) -> None:
         self._refresh_users()
-        peer = self.peers.get(peer_id)
-        if peer:
-            self._system_message(f"{peer['name']} appeared")
+        name = self._base_name(peer_id)
+        if name:
+            self._system_message(f"{name} appeared")
 
     def _on_peer_left(self, peer_id: str) -> None:
+        name = self._base_name(peer_id)
         peer = self.peers.pop(peer_id, None)
         if self.pm_target_id == peer_id:
             self.set_pm_target(None)
             self._system_message("Private note partner went away")
         self._refresh_users()
         if peer:
-            self._system_message(f"{peer['name']} went away")
+            self._system_message(f"{name} went away")
 
     def _base_name(self, peer_id: str) -> str:
         info = self.peers.get(peer_id)
@@ -440,7 +453,8 @@ class FlashDrop(QMainWindow):
         same_name = [pid for pid, other in self.peers.items()
                      if other["name"] == info["name"]]
         if len(same_name) > 1:
-            return f'{info["name"]} @{info["ip"]}'
+            host = info.get("host") or info["ip"]
+            return f'{info["name"]}@{host}'
         return info["name"]
 
     def _refresh_users(self) -> None:
@@ -458,6 +472,8 @@ class FlashDrop(QMainWindow):
         for _key, label, peer_id in sorted(rows):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, peer_id.encode("utf-8"))
+            if self.peers[peer_id].get("stale"):
+                item.setForeground(QColor("#999999"))
             self.user_list.addItem(item)
         self.peer_count_label.setText(
             f"{len(self.peers)} peer{'s' if len(self.peers) != 1 else ''}")
@@ -482,14 +498,53 @@ class FlashDrop(QMainWindow):
                 pass
 
     def _send(self, payload: dict) -> None:
+        for target in self._broadcast_targets():
+            self._send_to(payload, target)
+
+    def _send_to(self, payload: dict, target) -> None:
         payload = dict(payload)
         payload.setdefault("k", PROTOCOL_KEY)
         payload.setdefault("v", PROTOCOL_VERSION)
         try:
             self.sock.sendto(json.dumps(payload).encode("utf-8"),
-                             (BROADCAST_ADDR, BROADCAST_PORT))
+                             target)
         except OSError:
             pass
+
+    def _send_to_peers(self, payload: dict) -> None:
+        for info in list(self.peers.values()):
+            self._send_to(payload, (info["ip"], BROADCAST_PORT))
+
+    @staticmethod
+    def _broadcast_targets() -> list:
+        targets = []
+        seen = set()
+        try:
+            with open("/proc/net/route", encoding="ascii") as handle:
+                for line in handle:
+                    fields = line.strip().split()
+                    if len(fields) < 8 or fields[0] == "lo":
+                        continue
+                    if fields[2] != "00000000":
+                        continue
+                    try:
+                        network = int(fields[1], 16)
+                        mask = int(fields[7], 16)
+                    except ValueError:
+                        continue
+                    if mask == 0 or mask == 0xFFFFFFFF:
+                        continue
+                    broadcast = network | (~mask & 0xFFFFFFFF)
+                    addr = socket.inet_ntoa(
+                        struct.pack("<I", broadcast))
+                    if addr not in seen:
+                        seen.add(addr)
+                        targets.append((addr, BROADCAST_PORT))
+        except OSError:
+            pass
+        if not targets:
+            targets.append((BROADCAST_ADDR, BROADCAST_PORT))
+        return targets
 
     def _receiver_loop(self) -> None:
         while self.running:
@@ -513,41 +568,79 @@ class FlashDrop(QMainWindow):
             return
         mtype = msg.get("t")
         if mtype == "hello":
-            name = str(msg.get("name") or "anon")[:64]
-            known = peer_id in self.peers
-            old_name = self.peers[peer_id]["name"] if known else None
-            self.peers[peer_id] = {"name": name, "ip": addr[0],
-                                   "last_seen": time.time()}
-            if not known:
-                self.signals.peer_joined.emit(peer_id)
-            elif old_name != name:
-                self.signals.peer_changed.emit(peer_id)
+            self._note_peer(peer_id, msg, addr)
         elif mtype == "bye":
             self.signals.peer_left.emit(peer_id)
         elif mtype == "msg":
+            if self._seen_before(peer_id, msg.get("n")):
+                return
+            if peer_id not in self.peers:
+                self._note_peer(peer_id, msg, addr)
             text = str(msg.get("text") or "")[:MAX_TEXT]
             if text:
                 self.signals.message.emit(peer_id, text, False)
         elif mtype == "pm":
             if msg.get("to") != self.instance_id:
                 return
+            if self._seen_before(peer_id, msg.get("n")):
+                return
+            if peer_id not in self.peers:
+                self._note_peer(peer_id, msg, addr)
             text = str(msg.get("text") or "")[:MAX_TEXT]
             if text:
                 self.signals.message.emit(peer_id, text, True)
                 self.signals.raise_window.emit()
 
+    def _note_peer(self, peer_id: str, msg: dict,
+                    addr) -> None:
+        name = str(msg.get("name") or "anon")[:64]
+        host = str(msg.get("host") or "")[:64]
+        known = peer_id in self.peers
+        old_name = self.peers[peer_id]["name"] if known else None
+        was_stale = (self.peers[peer_id].get("stale")
+                     if known else False)
+        self.peers[peer_id] = {"name": name, "host": host,
+                               "ip": addr[0],
+                               "last_seen": time.time(),
+                               "stale": False}
+        if not known:
+            self.signals.peer_joined.emit(peer_id)
+        elif old_name != name or was_stale:
+            self.signals.peer_changed.emit(peer_id)
+
+    def _seen_before(self, peer_id: str, seq) -> bool:
+        if seq is None:
+            return False
+        key = (peer_id, seq)
+        if key in self._seen:
+            return True
+        self._seen[key] = time.time()
+        return False
+
     def _heartbeat_loop(self) -> None:
         while self.running:
-            self._send({"t": "hello", "id": self.instance_id,
-                        "name": self.username})
+            payload = {"t": "hello", "id": self.instance_id,
+                        "name": self.username,
+                        "host": socket.gethostname()}
+            self._send(payload)
+            self._send_to_peers(payload)
             time.sleep(HEARTBEAT_INTERVAL)
 
     def _prune_peers(self) -> None:
         now = time.time()
-        stale = [peer_id for peer_id, info in self.peers.items()
-                 if now - info["last_seen"] > PEER_TIMEOUT]
-        for peer_id in stale:
-            self._on_peer_left(peer_id)
+        for peer_id, info in list(self.peers.items()):
+            age = now - info["last_seen"]
+            if age > HARD_TIMEOUT:
+                self._on_peer_left(peer_id)
+            elif age > PEER_TIMEOUT and not info.get("stale"):
+                info["stale"] = True
+                self.signals.peer_changed.emit(peer_id)
+            elif age <= PEER_TIMEOUT and info.get("stale"):
+                info["stale"] = False
+                self.signals.peer_changed.emit(peer_id)
+        self._seen = {key: stamp for key, stamp in
+                      self._seen.items()
+                      if now - stamp < SEEN_TIMEOUT}
 
     def send(self) -> None:
         text = self.input.toPlainText().strip()
@@ -556,6 +649,7 @@ class FlashDrop(QMainWindow):
         if len(text) > MAX_TEXT:
             text = text[:MAX_TEXT]
             self._system_message(f"Message was cut to {MAX_TEXT} characters")
+        self._seq += 1
         if self.pm_target_id:
             target = self.peers.get(self.pm_target_id)
             if target is None:
@@ -563,14 +657,21 @@ class FlashDrop(QMainWindow):
                                      "message not sent")
                 self.set_pm_target(None)
                 return
-            self._send({"t": "pm", "id": self.instance_id,
+            payload = {"t": "pm", "id": self.instance_id,
                         "name": self.username,
-                        "to": self.pm_target_id, "text": text})
-            self._append_message(f"You -> {target['name']}", text,
-                                 own=True, private=True)
+                        "to": self.pm_target_id, "text": text,
+                        "n": self._seq}
+            self._send(payload)
+            self._send_to_peers(payload)
+            self._append_message(
+                f"You -> {self._base_name(self.pm_target_id)}",
+                text, own=True, private=True)
         else:
-            self._send({"t": "msg", "id": self.instance_id,
-                        "name": self.username, "text": text})
+            payload = {"t": "msg", "id": self.instance_id,
+                        "name": self.username, "text": text,
+                        "n": self._seq}
+            self._send(payload)
+            self._send_to_peers(payload)
             self._append_message("You", text, own=True)
         self.input.clear()
         self.input.setFocus()
@@ -578,7 +679,7 @@ class FlashDrop(QMainWindow):
     def set_pm_target(self, peer_id) -> None:
         self.pm_target_id = peer_id
         if peer_id and peer_id in self.peers:
-            name = self.peers[peer_id]["name"]
+            name = self._base_name(peer_id)
             self.recipient_label.setText(f"to: {name} (private)")
             self.input.setPlaceholderText(
                 f"Private note to {name} ... (Esc cancels)")
